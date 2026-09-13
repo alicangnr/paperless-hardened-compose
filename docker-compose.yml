@@ -1,0 +1,132 @@
+version: "3.9"
+
+# Referenz-Setup für ein gehärtetes Paperless-ngx mit optionaler
+# KI-Metadaten-Anreicherung über paperless-gpt.
+# Details je Härtungsmaßnahme: siehe docs/SECURITY.md
+
+networks:
+  db-internal:
+    internal: true          # kein Zugriff nach außen
+  proxy-external:
+    external: true          # wird von deinem Reverse-Proxy-Stack bereitgestellt
+    name: ${PROXY_NETWORK_NAME:-reverse-proxy_proxynet}
+
+services:
+  db:
+    image: postgres:14-alpine
+    restart: unless-stopped
+    networks:
+      - db-internal
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-paperless}
+      POSTGRES_USER: ${POSTGRES_USER:-paperless}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?bitte in .env setzen}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - db-internal
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  paperless-ngx:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+    networks:
+      - db-internal
+      - proxy-external
+    # Kein "ports:" nach außen — Zugriff ausschließlich über Reverse Proxy
+    environment:
+      PAPERLESS_REDIS: redis://redis:6379
+      PAPERLESS_DBHOST: db
+      PAPERLESS_DBNAME: ${POSTGRES_DB:-paperless}
+      PAPERLESS_DBUSER: ${POSTGRES_USER:-paperless}
+      PAPERLESS_DBPASS: ${POSTGRES_PASSWORD:?bitte in .env setzen}
+      PAPERLESS_URL: ${PAPERLESS_URL:?z.B. https://paperless.example.com}
+      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY:?bitte in .env setzen}
+    volumes:
+      - paperless-data:/usr/src/paperless/data
+      - paperless-media:/usr/src/paperless/media
+      - paperless-export:/usr/src/paperless/export
+      - paperless-consume:/usr/src/paperless/consume
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  # Optional: KI-gestützte Metadaten-Anreicherung.
+  # WICHTIG: paperless-gpt bringt KEINE eigene Authentifizierung mit.
+  # Daher niemals mit "ports:" nach außen exponieren — ausschließlich über
+  # den Reverse Proxy, der seinerseits Auth/Access-Control übernimmt.
+  paperless-gpt:
+    image: ghcr.io/icereed/paperless-gpt:${PAPERLESS_GPT_VERSION:?Version fixieren, kein :latest}
+    restart: unless-stopped
+    depends_on:
+      - paperless-ngx
+    networks:
+      - proxy-external
+    environment:
+      PAPERLESS_BASE_URL: http://paperless-ngx:8000
+      PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN:?bitte in .env setzen}
+      LLM_BASE_URL: ${LLM_BASE_URL:?z.B. http://ollama-host:11434 via VPN}
+      LLM_MODEL: ${LLM_MODEL:-qwen3:14b}
+      # Bewusst deaktiviert: keine automatische Verarbeitung.
+      # Trigger erfolgt manuell über das Tag "paperless-gpt" in der UI.
+      AUTO_TAG: "false"
+      # Bewusst deaktiviert, solange keine verifizierte Backup-Strategie
+      # für Originaldokumente existiert.
+      PDF_REPLACE: "false"
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    command: --label-enable --cleanup --interval 86400
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  db-data:
+  paperless-data:
+  paperless-media:
+  paperless-export:
+  paperless-consume:
